@@ -224,6 +224,17 @@ contract GuardHook is BaseHook, IGuardHook {
         return _oracleReason();
     }
 
+    /// @notice The drawdown limit remains in the single authoritative HealthParams copy.
+    function maxDrawdownBps() external view returns (uint16) {
+        return healthParams.maxDrawdownBps;
+    }
+
+    /// @notice One validated read for epoch valuation: zero reason means the price passed every check.
+    function validatedOraclePrice() external view returns (uint256 priceX18, bytes32 reason) {
+        if (PoolId.unwrap(poolId) == bytes32(0)) revert PoolNotSet();
+        return _oracleState();
+    }
+
     // ---------------------------------------------------------------- vault-only
     /// @dev The vault checks that the caller is the curator. Only strictly more restrictive targets.
     /// @notice The checks a rebalance must pass. On failure it steps down and RETURNS false instead of
@@ -303,23 +314,32 @@ contract GuardHook is BaseHook, IGuardHook {
     ///      raw words, so a revert, a missing or short return value, or a malformed bool all become a
     ///      failure code instead of reverting the caller.
     function _oracleReason() internal view returns (bytes32) {
+        (, bytes32 reason) = _oracleState();
+        return reason;
+    }
+
+    /// @dev One low-level read, decoded defensively. A failure returns a zero price and a non-zero reason,
+    ///      so callers cannot accidentally use an unvalidated price for reporting or execution.
+    function _oracleState() internal view returns (uint256 priceX18, bytes32 reason) {
         (bool ok, bytes memory ret) = address(oracle).staticcall(abi.encodeCall(IOracleAdapter.getPrice, ()));
-        if (!ok || ret.length != 96) return Reasons.ORACLE_FAIL;
-        (uint256 priceX18, uint256 updatedAt, uint256 validWord) = abi.decode(ret, (uint256, uint256, uint256));
+        if (!ok || ret.length != 96) return (0, Reasons.ORACLE_FAIL);
+        uint256 updatedAt;
+        uint256 validWord;
+        (priceX18, updatedAt, validWord) = abi.decode(ret, (uint256, uint256, uint256));
 
         if (validWord != 1 || priceX18 == 0 || priceX18 > type(uint128).max || updatedAt > block.timestamp) {
-            return Reasons.ORACLE_INVALID;
+            return (0, Reasons.ORACLE_INVALID);
         }
 
         StrategyTypes.HealthParams memory p = healthParams;
-        if (block.timestamp - updatedAt > p.maxOracleAge) return Reasons.ORACLE_STALE;
+        if (block.timestamp - updatedAt > p.maxOracleAge) return (0, Reasons.ORACLE_STALE);
 
         (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(poolManager, poolId);
         uint256 poolPrice = PriceMath.sqrtPriceToPrice1e18(sqrtPriceX96, dec0, dec1);
         uint256 diff = poolPrice > priceX18 ? poolPrice - priceX18 : priceX18 - poolPrice;
-        if (diff * 10_000 > priceX18 * p.maxDeviationBps) return Reasons.DEVIATION;
+        if (diff * 10_000 > priceX18 * p.maxDeviationBps) return (0, Reasons.DEVIATION);
 
-        return Reasons.NONE;
+        return (priceX18, Reasons.NONE);
     }
 
     /// @dev Overdue is measured from the later of the last rebalance and the last mode change,

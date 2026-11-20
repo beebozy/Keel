@@ -777,3 +777,13 @@ This is a design specification. It is not audited Solidity, and the illustrative
 | Step-down / step-up | Move to a more or less restrictive mode |
 | In-kind withdrawal | Returning both underlying tokens without swapping |
 | MEV | Value captured by transaction ordering, such as sandwich attacks |
+
+## Architecture
+
+Keel stores a minimal on-chain epoch snapshot in the Vault: timestamp, share price,
+whether the price was oracle-valued, and drawdown. Epochs are used to enforce
+drawdown-based step-downs safely.
+
+Performance against passive LP, HODL and lending benchmarks is computed off-chain by
+the dashboard/indexer from on-chain events and state. This keeps gas costs low and
+allows benchmark methodology to evolve without redeploying the contracts.

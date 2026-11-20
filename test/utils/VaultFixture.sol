@@ -70,6 +70,10 @@ abstract contract VaultFixture is Test {
         });
     }
 
+    function _epochInterval() internal pure virtual returns (uint32) {
+        return 1 days;
+    }
+
     function _rebalanceConfig() internal pure virtual returns (StrategyTypes.RebalanceConfig memory) {
         return StrategyTypes.RebalanceConfig({
             minIntervalBlocks: 10,
@@ -96,7 +100,10 @@ abstract contract VaultFixture is Test {
             timelock: 2 days,
             rangeWidthTicks: 2400,
             ruleBasedDepositsEnabled: ruleBasedDeposits,
-            rebalance: _rebalanceConfig()
+            rebalance: _rebalanceConfig(),
+            epochInterval: _epochInterval(),
+            dec0: dec0,
+            dec1: dec1
         });
     }
 
@@ -124,9 +131,7 @@ abstract contract VaultFixture is Test {
                 ^ (0x4444 << 144)
         );
         deployCodeTo(
-            "GuardHook.sol:GuardHook",
-            abi.encode(manager, oracle, address(this), _params(), dec0, dec1),
-            hookAddr
+            "GuardHook.sol:GuardHook", abi.encode(manager, oracle, address(this), _params(), dec0, dec1), hookAddr
         );
         hook = GuardHook(hookAddr);
 

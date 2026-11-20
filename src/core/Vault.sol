@@ -8,6 +8,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
@@ -22,6 +23,7 @@ import {RiskPolicy} from "../libraries/RiskPolicy.sol";
 import {RangeMath} from "../libraries/RangeMath.sol";
 import {RebalanceMath} from "../libraries/RebalanceMath.sol";
 import {VaultAccounting} from "../libraries/VaultAccounting.sol";
+import {PriceMath} from "../libraries/PriceMath.sol";
 import {IVault} from "../interfaces/IVault.sol";
 import {IVaultView} from "../interfaces/IVaultView.sol";
 import {IGuardHook} from "../interfaces/IGuardHook.sol";
@@ -50,6 +52,8 @@ contract Vault is ERC20, ReentrancyGuard, IVault, IVaultView, IUnlockCallback {
     error SlippageExceeded();
     error UnwindNotAllowed();
     error TooSoon();
+    error EpochTooSoon();
+    error UnknownEpoch();
     error DepositRejected(bytes32 reason);
 
     // ---------------------------------------------------------------- events
@@ -60,6 +64,9 @@ contract Vault is ERC20, ReentrancyGuard, IVault, IVaultView, IUnlockCallback {
     event Rebalanced(address indexed caller, int24 oldLower, int24 oldUpper, int24 newLower, int24 newUpper);
     event RebalanceSkipped(bytes32 reason);
     event CallerCredited(address indexed caller, uint256 amount0, uint256 amount1);
+    event EpochClosed(
+        uint64 indexed epoch, uint64 timestamp, uint256 sharePrice1e18, bool oracleValued, uint16 drawdownBps
+    );
 
     // ---------------------------------------------------------------- types
     /// @dev Pool-specific settings, grouped to keep the constructor within the stack limit.
@@ -71,6 +78,22 @@ contract Vault is ERC20, ReentrancyGuard, IVault, IVaultView, IUnlockCallback {
         uint24 rangeWidthTicks; // must be a multiple of 2 * tickSpacing
         bool ruleBasedDepositsEnabled;
         StrategyTypes.RebalanceConfig rebalance;
+        uint32 epochInterval; // minimum seconds between epoch closes
+        uint8 dec0; // token decimals, used only for reporting valuation
+        uint8 dec1;
+    }
+
+    /// @dev Minimal on-chain snapshot (decision: hybrid). Benchmark returns are deliberately not stored;
+    ///      the indexer derives them from these records plus events and public pool state.
+    struct EpochRecord {
+        uint64 epoch;
+        uint64 timestamp;
+        uint64 blockNumber;
+        uint256 value1e18; // holdings valued in token1, 1e18 per whole token1
+        uint256 sharePrice1e18; // value per 1e18 raw shares
+        uint16 drawdownBps;
+        StrategyTypes.RiskMode mode;
+        bool oracleValued;
     }
 
     enum Action {
@@ -111,9 +134,12 @@ contract Vault is ERC20, ReentrancyGuard, IVault, IVaultView, IUnlockCallback {
     uint32 public immutable override timelock;
     uint24 public immutable rangeWidthTicks;
     bool public immutable ruleBasedDepositsEnabled;
-    /// @dev Used from the epoch milestone for reporting. Never used for deposits or withdrawals.
+    /// @dev Reporting only. These never affect deposits or withdrawals.
     address public immutable oracle;
     uint48 public immutable maxOracleAge;
+    uint32 public immutable epochInterval;
+    uint8 public immutable dec0;
+    uint8 public immutable dec1;
 
     // ---------------------------------------------------------------- state
     PoolKey public key;
@@ -127,7 +153,14 @@ contract Vault is ERC20, ReentrancyGuard, IVault, IVaultView, IUnlockCallback {
     uint256 public feesAccrued1;
     uint64 public lastRebalanceBlock;
     uint64 public rebalanceCount;
-    uint64 public override epochCount; // epochs arrive in a later milestone
+
+    /// @dev Fixed-size ring buffer: slot = epoch % EPOCH_WINDOW. Older records remain in events.
+    uint256 public constant EPOCH_WINDOW = 64;
+    mapping(uint256 slot => EpochRecord) public epochRecords;
+    uint256 public highWaterSharePrice;
+    uint64 public lastEpochTimestamp;
+    uint64 public override epochCount;
+
     bool private _unlocking;
 
     constructor(
@@ -145,7 +178,7 @@ contract Vault is ERC20, ReentrancyGuard, IVault, IVaultView, IUnlockCallback {
             revert ZeroAddress();
         }
         if (cfg.curator == address(0) || address(cfg.poolManager) == address(0)) revert ZeroAddress();
-        if (maxOracleAge_ == 0) revert InvalidConfig();
+        if (maxOracleAge_ == 0 || cfg.epochInterval == 0 || cfg.dec0 > 36 || cfg.dec1 > 36) revert InvalidConfig();
 
         // the pool key must agree with the addresses the caller passed in
         if (poolId_ == bytes32(0) || PoolId.unwrap(cfg.poolKey.toId()) != poolId_) revert InvalidPoolId();
@@ -173,6 +206,9 @@ contract Vault is ERC20, ReentrancyGuard, IVault, IVaultView, IUnlockCallback {
         rebalanceConfig = cfg.rebalance;
         oracle = oracle_;
         maxOracleAge = maxOracleAge_;
+        epochInterval = cfg.epochInterval;
+        dec0 = cfg.dec0;
+        dec1 = cfg.dec1;
     }
 
     function _validateRebalanceConfig(StrategyTypes.RebalanceConfig memory rc) internal pure {
@@ -229,7 +265,11 @@ contract Vault is ERC20, ReentrancyGuard, IVault, IVaultView, IUnlockCallback {
 
     /// @notice Burn shares and receive the proportional share of both tokens. Never uses a price and
     ///         is allowed in every mode.
-    function withdraw(uint256 shares, address receiver) external nonReentrant returns (uint256 amount0, uint256 amount1) {
+    function withdraw(uint256 shares, address receiver)
+        external
+        nonReentrant
+        returns (uint256 amount0, uint256 amount1)
+    {
         RiskPolicy.enforce(IGuardHook(guardHook).mode(), StrategyTypes.Operation.WITHDRAW, ruleBasedDepositsEnabled);
         if (shares == 0 || receiver == address(0)) revert ZeroAmount();
 
@@ -330,6 +370,62 @@ contract Vault is ERC20, ReentrancyGuard, IVault, IVaultView, IUnlockCallback {
         IGuardHook(guardHook).curatorStepDown(target);
     }
 
+    /// @notice Permissionless periodic snapshot. Records the share price and whether it was oracle-valued.
+    ///         Only oracle-valued epochs may move the high-water mark or trigger a drawdown step-down, so a
+    ///         manipulated pool price cannot degrade the strategy (INV-18). Benchmark returns are computed
+    ///         off-chain from these records; nothing here reads a benchmark contract.
+    function closeEpoch() external nonReentrant {
+        if (block.timestamp < uint256(lastEpochTimestamp) + epochInterval) revert EpochTooSoon();
+
+        (uint160 sqrtP,,,) = StateLibrary.getSlot0(poolManager, PoolId.wrap(poolId));
+        (uint256 a0, uint256 a1) = _holdings(sqrtP);
+
+        // The same validation that gates ADAPTIVE decides whether this snapshot can be trusted for drawdown.
+        (uint256 oraclePrice, bytes32 reason) = IGuardHook(guardHook).validatedOraclePrice();
+        bool oracleValued = reason == Reasons.NONE;
+        uint256 price = oracleValued ? oraclePrice : PriceMath.sqrtPriceToPrice1e18(sqrtP, dec0, dec1);
+
+        uint256 value = FullMath.mulDiv(a0, price, 10 ** uint256(dec0)) + FullMath.mulDiv(a1, 1e18, 10 ** uint256(dec1));
+
+        uint256 supply = totalSupply();
+        uint256 sharePrice = supply == 0 ? 0 : FullMath.mulDiv(value, 1e18, supply);
+
+        uint16 drawdown;
+        if (oracleValued && sharePrice > 0) {
+            if (highWaterSharePrice == 0) {
+                highWaterSharePrice = sharePrice;
+            } else {
+                if (sharePrice < highWaterSharePrice) {
+                    uint256 bps = FullMath.mulDiv(highWaterSharePrice - sharePrice, 10_000, highWaterSharePrice);
+                    drawdown = uint16(bps > type(uint16).max ? type(uint16).max : bps);
+                } else {
+                    highWaterSharePrice = sharePrice;
+                }
+                if (drawdown > IGuardHook(guardHook).maxDrawdownBps()) {
+                    // Reset the watermark after reporting so one breach does not step the mode down on
+                    // every later epoch. A new high-water mark starts a new drawdown episode.
+                    highWaterSharePrice = sharePrice;
+                    IGuardHook(guardHook).reportDrawdownBreach();
+                }
+            }
+        }
+
+        uint64 epoch = epochCount;
+        epochRecords[epoch % EPOCH_WINDOW] = EpochRecord({
+            epoch: epoch,
+            timestamp: uint64(block.timestamp),
+            blockNumber: uint64(block.number),
+            value1e18: value,
+            sharePrice1e18: sharePrice,
+            drawdownBps: drawdown,
+            mode: IGuardHook(guardHook).mode(), // read after a possible step-down
+            oracleValued: oracleValued
+        });
+        epochCount = epoch + 1;
+        lastEpochTimestamp = uint64(block.timestamp);
+        emit EpochClosed(epoch, uint64(block.timestamp), sharePrice, oracleValued, drawdown);
+    }
+
     // ================================================================ views
     /// @dev Read by GuardHook.setVault() to confirm the link.
     function hook() external view override returns (address) {
@@ -357,6 +453,13 @@ contract Vault is ERC20, ReentrancyGuard, IVault, IVaultView, IUnlockCallback {
 
     function totalSupply() public view override(ERC20, IVault) returns (uint256) {
         return super.totalSupply();
+    }
+
+    /// @notice Read a snapshot from the ring buffer. Reverts once that epoch has been overwritten.
+    function getEpoch(uint256 epoch) external view returns (EpochRecord memory r) {
+        if (epoch >= epochCount) revert UnknownEpoch();
+        r = epochRecords[epoch % EPOCH_WINDOW];
+        if (r.epoch != epoch) revert UnknownEpoch();
     }
 
     // ================================================================ PoolManager callback
@@ -397,7 +500,11 @@ contract Vault is ERC20, ReentrancyGuard, IVault, IVaultView, IUnlockCallback {
         if (first) {
             (tickLower, tickUpper) = RangeMath.centerRange(tick, key.tickSpacing, rangeWidthTicks);
             uint128 dl = RangeMath.liquidityForAmounts(
-                sqrtP, TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper), d.amount0, d.amount1
+                sqrtP,
+                TickMath.getSqrtPriceAtTick(tickLower),
+                TickMath.getSqrtPriceAtTick(tickUpper),
+                d.amount0,
+                d.amount1
             );
             if (dl <= VaultAccounting.MINIMUM_SHARES) revert DepositTooSmall();
             shares = dl; // shares start equal to liquidity units, which do not depend on token decimals
@@ -464,8 +571,7 @@ contract Vault is ERC20, ReentrancyGuard, IVault, IVaultView, IUnlockCallback {
 
         (uint160 sqrtP, int24 tick,,) = StateLibrary.getSlot0(poolManager, PoolId.wrap(poolId));
         (uint256 a0, uint256 a1) = _holdings(sqrtP);
-        (int24 newLower, int24 newUpper) =
-            RebalanceMath.fitRange(sqrtP, tick, key.tickSpacing, rangeWidthTicks, a0, a1);
+        (int24 newLower, int24 newUpper) = RebalanceMath.fitRange(sqrtP, tick, key.tickSpacing, rangeWidthTicks, a0, a1);
 
         r.oldLower = tickLower;
         r.oldUpper = tickUpper;
@@ -537,10 +643,7 @@ contract Vault is ERC20, ReentrancyGuard, IVault, IVaultView, IUnlockCallback {
         (BalanceDelta delta,) = poolManager.modifyLiquidity(
             key,
             ModifyLiquidityParams({
-                tickLower: tickLower,
-                tickUpper: tickUpper,
-                liquidityDelta: int256(uint256(dl)),
-                salt: bytes32(0)
+                tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: int256(uint256(dl)), salt: bytes32(0)
             }),
             ""
         );
@@ -573,10 +676,7 @@ contract Vault is ERC20, ReentrancyGuard, IVault, IVaultView, IUnlockCallback {
         (BalanceDelta delta,) = poolManager.modifyLiquidity(
             key,
             ModifyLiquidityParams({
-                tickLower: tickLower,
-                tickUpper: tickUpper,
-                liquidityDelta: -int256(uint256(dl)),
-                salt: bytes32(0)
+                tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: -int256(uint256(dl)), salt: bytes32(0)
             }),
             ""
         );

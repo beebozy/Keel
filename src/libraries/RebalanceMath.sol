@@ -2,7 +2,6 @@
 pragma solidity ^0.8.26;
 
 import {FullMath} from "v4-core/libraries/FullMath.sol";
-import {FixedPoint96} from "v4-core/libraries/FixedPoint96.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {RangeMath} from "./RangeMath.sol";
 
@@ -47,7 +46,10 @@ library RebalanceMath {
         });
 
         uint256 best = _crossover(c);
-        if (best > 0 && _deployedValue(c, best - 1) > _deployedValue(c, best)) best = best - 1;
+        if (best > 0) {
+            uint256 target = _share(c.a0, c.a1);
+            if (_gap(_shareOf(c, best - 1), target) < _gap(_shareOf(c, best), target)) best = best - 1;
+        }
 
         lower = _lowerAt(c, best);
         upper = lower + int24(uint24(width));
@@ -80,11 +82,22 @@ library RebalanceMath {
         return x * c.a1 >= y * c.a0;
     }
 
-    /// @dev Value (in token1 units at the current price) that candidate i can deploy from (a0, a1).
-    function _deployedValue(Ctx memory c, uint256 i) private pure returns (uint256) {
+    /// @dev token0 fraction of a composition, scaled by 1e18. Uses FullMath so extreme ticks cannot overflow.
+    function _share(uint256 a0, uint256 a1) private pure returns (uint256) {
+        uint256 total = a0 + a1;
+        return total == 0 ? 0 : FullMath.mulDiv(a0, 1e18, total);
+    }
+
+    /// @dev Composition of candidate i at a fixed reference liquidity; liquidity itself is never fitted,
+    ///      so a candidate that cannot absorb the holdings still produces a comparable score instead of
+    ///      reverting on LiquidityOverflow at extreme prices.
+    function _shareOf(Ctx memory c, uint256 i) private pure returns (uint256) {
         (uint160 sqrtA, uint160 sqrtB) = _sqrtBounds(c, i);
-        (, uint256 c0, uint256 c1) = RangeMath.fitLiquidity(c.sqrtP, sqrtA, sqrtB, c.a0, c.a1);
-        uint256 priceQ96 = FullMath.mulDiv(c.sqrtP, c.sqrtP, FixedPoint96.Q96);
-        return FullMath.mulDiv(c0, priceQ96, FixedPoint96.Q96) + c1;
+        (uint256 x, uint256 y) = RangeMath.amountsForLiquidity(c.sqrtP, sqrtA, sqrtB, REFERENCE_LIQUIDITY, false);
+        return _share(x, y);
+    }
+
+    function _gap(uint256 a, uint256 b) private pure returns (uint256) {
+        return a > b ? a - b : b - a;
     }
 }

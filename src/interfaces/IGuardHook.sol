@@ -39,6 +39,11 @@ interface IGuardHook {
     function needsRebalance() external view returns (bool);
     /// @notice Read-only oracle check for ADAPTIVE. Zero when healthy.
     function oracleReason() external view returns (bytes32);
+    /// @notice The drawdown limit, from the single authoritative HealthParams copy.
+    function maxDrawdownBps() external view returns (uint16);
+    /// @notice Price only when it passed every validation; otherwise reason != 0 and price is zero.
+    ///         Lets the vault value an epoch with the oracle without duplicating the safety checks.
+    function validatedOraclePrice() external view returns (uint256 priceX18, bytes32 reason);
     function evaluate() external;
     function tryStepUp() external;
     function setVault(address vault) external;

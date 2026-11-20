@@ -402,6 +402,38 @@ contract GuardHookModesTest is Test {
         assertEq(uint8(hook.mode()), uint8(ADAPTIVE));
     }
 
+    // ------------------------------------------------------------ epoch-facing views
+    function test_healthViews_healthy() public view {
+        assertEq(hook.maxDrawdownBps(), _params().maxDrawdownBps);
+        (uint256 price, bytes32 reason) = hook.validatedOraclePrice();
+        assertEq(reason, Reasons.NONE);
+        assertEq(price, 1e18);
+    }
+
+    function test_healthViews_failuresReturnZeroPriceAndReason() public {
+        oracle.setRevert(true);
+        (uint256 price, bytes32 reason) = hook.validatedOraclePrice();
+        assertEq(reason, Reasons.ORACLE_FAIL);
+        assertEq(price, 0);
+
+        oracle.setRevert(false);
+        oracle.setValid(false);
+        (price, reason) = hook.validatedOraclePrice();
+        assertEq(reason, Reasons.ORACLE_INVALID);
+        assertEq(price, 0);
+
+        oracle.setValid(true);
+        oracle.setPriceAt(1e18, block.timestamp - 3601);
+        (price, reason) = hook.validatedOraclePrice();
+        assertEq(reason, Reasons.ORACLE_STALE);
+        assertEq(price, 0);
+
+        oracle.setPrice(1.02e18); // refreshes the timestamp; only deviation remains
+        (price, reason) = hook.validatedOraclePrice();
+        assertEq(reason, Reasons.DEVIATION);
+        assertEq(price, 0);
+    }
+
     // ------------------------------------------------------------ rebalance eligibility
     function test_oracleReason_healthyIsNone() public view {
         assertEq(hook.oracleReason(), Reasons.NONE);
