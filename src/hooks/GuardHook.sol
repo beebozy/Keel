@@ -82,6 +82,7 @@ contract GuardHook is BaseHook, IGuardHook {
         uint8 _dec1
     ) BaseHook(_poolManager) {
         if (address(_oracle).code.length == 0) revert InvalidParams();
+        if (_dec0 > 36 || _dec1 > 36) revert InvalidParams();
         _validate(_params);
         oracle = _oracle;
         deployer = _deployer;

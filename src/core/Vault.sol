@@ -1,0 +1,480 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+
+import {StrategyTypes} from "../types/StrategyTypes.sol";
+import {RiskPolicy} from "../libraries/RiskPolicy.sol";
+import {RangeMath} from "../libraries/RangeMath.sol";
+import {VaultAccounting} from "../libraries/VaultAccounting.sol";
+import {IVault} from "../interfaces/IVault.sol";
+import {IVaultView} from "../interfaces/IVaultView.sol";
+import {IGuardHook} from "../interfaces/IGuardHook.sol";
+
+/// @title Vault
+/// @notice Pool-specific vault: holds one concentrated position in one v4 pool and issues ERC-20 shares
+///         over it. Deposits are proportional and oracle-free; withdrawals are in kind and never need a
+///         price, so they work in every mode.
+/// @dev Milestone 2: deposit, withdraw, unwind, fee collection. Rebalance arrives in the next milestone.
+///      Execution lives here (decision E-1): the contract that calls PoolManager.unlock must also settle
+///      the token deltas. The GuardHook owns the mode (S-1). Not audited.
+///      This contract replaces the `SharedVault` base: the share accounting is VaultAccounting plus the
+///      internal `idle0` / `idle1` balances, so no separate accounting layer is inherited.
+contract Vault is ERC20, ReentrancyGuard, IVault, IVaultView, IUnlockCallback {
+    using SafeERC20 for IERC20;
+    using PoolIdLibrary for PoolKey;
+
+    // ---------------------------------------------------------------- errors
+    error ZeroAddress();
+    error InvalidPoolId();
+    error InvalidConfig();
+    error NotCurator();
+    error NotPoolManager();
+    error NotInUnlock();
+    error ZeroAmount();
+    error ZeroShares();
+    error DepositTooSmall();
+    error SlippageExceeded();
+    error UnwindNotAllowed();
+    error RebalanceNotImplemented();
+
+    // ---------------------------------------------------------------- events
+    event StrategyOperation(bytes32 indexed poolId, uint8 indexed operation, address indexed caller);
+    event Deposited(address indexed caller, address indexed receiver, uint256 amount0, uint256 amount1, uint256 shares);
+    event Withdrawn(address indexed owner, address indexed receiver, uint256 shares, uint256 amount0, uint256 amount1);
+    event Unwound(uint256 amount0, uint256 amount1);
+
+    // ---------------------------------------------------------------- types
+    /// @dev Pool-specific settings, grouped to keep the constructor within the stack limit.
+    struct VaultConfig {
+        IPoolManager poolManager;
+        PoolKey poolKey;
+        address curator;
+        uint32 timelock;
+        uint24 rangeWidthTicks; // must be a multiple of 2 * tickSpacing
+        bool ruleBasedDepositsEnabled;
+    }
+
+    enum Action {
+        DEPOSIT,
+        WITHDRAW,
+        UNWIND
+    }
+
+    struct CallbackData {
+        Action action;
+        address user;
+        address receiver;
+        uint256 amount0;
+        uint256 amount1;
+        uint256 shares;
+        uint256 minShares;
+    }
+
+    // ---------------------------------------------------------------- immutables
+    bytes32 public immutable override poolId;
+    address public immutable guardHook;
+    IPoolManager public immutable poolManager;
+    address public immutable token0;
+    address public immutable token1;
+    address public immutable override curator;
+    uint32 public immutable override timelock;
+    uint24 public immutable rangeWidthTicks;
+    bool public immutable ruleBasedDepositsEnabled;
+    /// @dev Used from the epoch milestone for reporting. Never used for deposits or withdrawals.
+    address public immutable oracle;
+    uint48 public immutable maxOracleAge;
+
+    // ---------------------------------------------------------------- state
+    PoolKey public key;
+    int24 public tickLower;
+    int24 public tickUpper;
+    uint128 public liquidity; // liquidity this vault owns in the pool
+    uint256 public idle0; // internal accounting, NOT balanceOf: donations cannot move the share price
+    uint256 public idle1;
+    uint64 public override epochCount; // epochs arrive in a later milestone
+    bool private _unlocking;
+
+    constructor(
+        address token0_,
+        address token1_,
+        address oracle_,
+        uint48 maxOracleAge_,
+        string memory name_,
+        string memory symbol_,
+        bytes32 poolId_,
+        address guardHook_,
+        VaultConfig memory cfg
+    ) ERC20(name_, symbol_) {
+        if (token0_ == address(0) || token1_ == address(0) || oracle_ == address(0) || guardHook_ == address(0)) {
+            revert ZeroAddress();
+        }
+        if (cfg.curator == address(0) || address(cfg.poolManager) == address(0)) revert ZeroAddress();
+        if (maxOracleAge_ == 0) revert InvalidConfig();
+
+        // the pool key must agree with the addresses the caller passed in
+        if (poolId_ == bytes32(0) || PoolId.unwrap(cfg.poolKey.toId()) != poolId_) revert InvalidPoolId();
+        if (
+            Currency.unwrap(cfg.poolKey.currency0) != token0_ || Currency.unwrap(cfg.poolKey.currency1) != token1_
+                || address(cfg.poolKey.hooks) != guardHook_
+        ) revert InvalidConfig();
+
+        // range must fit the tick spacing; native ETH is not supported
+        if (cfg.poolKey.tickSpacing <= 0) revert InvalidConfig();
+        uint24 step = uint24(cfg.poolKey.tickSpacing) * 2;
+        if (cfg.rangeWidthTicks == 0 || cfg.rangeWidthTicks % step != 0) revert InvalidConfig();
+
+        poolId = poolId_;
+        guardHook = guardHook_;
+        poolManager = cfg.poolManager;
+        key = cfg.poolKey;
+        token0 = token0_;
+        token1 = token1_;
+        curator = cfg.curator;
+        timelock = cfg.timelock;
+        rangeWidthTicks = cfg.rangeWidthTicks;
+        ruleBasedDepositsEnabled = cfg.ruleBasedDepositsEnabled;
+        oracle = oracle_;
+        maxOracleAge = maxOracleAge_;
+    }
+
+    // ================================================================ user entry points
+    /// @notice Deposit up to (amount0, amount1). Only the proportional amounts are taken.
+    /// @dev Has no slippage protection. Frontends should use the overload with `minShares`.
+    function deposit(uint256 amount0, uint256 amount1, address receiver) external returns (uint256 shares) {
+        return _deposit(amount0, amount1, receiver, 0);
+    }
+
+    function deposit(uint256 amount0, uint256 amount1, address receiver, uint256 minShares)
+        external
+        returns (uint256 shares)
+    {
+        return _deposit(amount0, amount1, receiver, minShares);
+    }
+
+    function _deposit(uint256 amount0, uint256 amount1, address receiver, uint256 minShares)
+        internal
+        nonReentrant
+        returns (uint256 shares)
+    {
+        RiskPolicy.enforce(IGuardHook(guardHook).mode(), StrategyTypes.Operation.DEPOSIT, ruleBasedDepositsEnabled);
+        if ((amount0 == 0 && amount1 == 0) || receiver == address(0)) revert ZeroAmount();
+
+        bytes memory ret = _unlock(
+            CallbackData({
+                action: Action.DEPOSIT,
+                user: msg.sender,
+                receiver: receiver,
+                amount0: amount0,
+                amount1: amount1,
+                shares: 0,
+                minShares: minShares
+            })
+        );
+        uint256 c0;
+        uint256 c1;
+        (shares, c0, c1) = abi.decode(ret, (uint256, uint256, uint256));
+        emit Deposited(msg.sender, receiver, c0, c1, shares);
+        emit StrategyOperation(poolId, uint8(StrategyTypes.Operation.DEPOSIT), msg.sender);
+    }
+
+    /// @notice Burn shares and receive the proportional share of both tokens. Never uses a price and
+    ///         is allowed in every mode.
+    function withdraw(uint256 shares, address receiver) external nonReentrant returns (uint256 amount0, uint256 amount1) {
+        RiskPolicy.enforce(IGuardHook(guardHook).mode(), StrategyTypes.Operation.WITHDRAW, ruleBasedDepositsEnabled);
+        if (shares == 0 || receiver == address(0)) revert ZeroAmount();
+
+        bytes memory ret = _unlock(
+            CallbackData({
+                action: Action.WITHDRAW,
+                user: msg.sender,
+                receiver: receiver,
+                amount0: 0,
+                amount1: 0,
+                shares: shares,
+                minShares: 0
+            })
+        );
+        (amount0, amount1) = abi.decode(ret, (uint256, uint256));
+        emit Withdrawn(msg.sender, receiver, shares, amount0, amount1);
+        emit StrategyOperation(poolId, uint8(StrategyTypes.Operation.WITHDRAW), msg.sender);
+    }
+
+    /// @notice Pull all liquidity out of the pool into idle balances. Anyone may call it in EXIT;
+    ///         otherwise only the curator, and only where the risk policy allows it. Funds stay in the
+    ///         vault and remain claimable only through share withdrawals.
+    function unwind() external nonReentrant returns (uint256 amount0, uint256 amount1) {
+        StrategyTypes.RiskMode mode = IGuardHook(guardHook).mode();
+        RiskPolicy.enforce(mode, StrategyTypes.Operation.UNWIND, ruleBasedDepositsEnabled);
+        if (mode != StrategyTypes.RiskMode.EXIT && msg.sender != curator) revert UnwindNotAllowed();
+
+        bytes memory ret = _unlock(
+            CallbackData({
+                action: Action.UNWIND,
+                user: msg.sender,
+                receiver: msg.sender,
+                amount0: 0,
+                amount1: 0,
+                shares: 0,
+                minShares: 0
+            })
+        );
+        (amount0, amount1) = abi.decode(ret, (uint256, uint256));
+        emit Unwound(amount0, amount1);
+        emit StrategyOperation(poolId, uint8(StrategyTypes.Operation.UNWIND), msg.sender);
+    }
+
+    /// @notice Reserved for the next milestone: permissionless, computed by the vault (decision K-1).
+    function rebalance() external pure {
+        revert RebalanceNotImplemented();
+    }
+
+    /// @notice The curator may only make the mode more restrictive. The hook enforces the direction.
+    function curatorStepDown(StrategyTypes.RiskMode target) external {
+        if (msg.sender != curator) revert NotCurator();
+        IGuardHook(guardHook).curatorStepDown(target);
+    }
+
+    // ================================================================ views
+    /// @dev Read by GuardHook.setVault() to confirm the link.
+    function hook() external view override returns (address) {
+        return guardHook;
+    }
+
+    function asset0() external view returns (address) {
+        return token0;
+    }
+
+    function asset1() external view returns (address) {
+        return token1;
+    }
+
+    /// @notice Principal in the position at the current price plus idle. Excludes fees not yet collected.
+    function totalAssets0() external view returns (uint256 a0) {
+        (uint160 sqrtP,,,) = StateLibrary.getSlot0(poolManager, PoolId.wrap(poolId));
+        (a0,) = _holdings(sqrtP);
+    }
+
+    function totalAssets1() external view returns (uint256 a1) {
+        (uint160 sqrtP,,,) = StateLibrary.getSlot0(poolManager, PoolId.wrap(poolId));
+        (, a1) = _holdings(sqrtP);
+    }
+
+    function totalSupply() public view override(ERC20, IVault) returns (uint256) {
+        return super.totalSupply();
+    }
+
+    // ================================================================ PoolManager callback
+    function unlockCallback(bytes calldata raw) external returns (bytes memory) {
+        if (msg.sender != address(poolManager)) revert NotPoolManager();
+        if (!_unlocking) revert NotInUnlock();
+        CallbackData memory d = abi.decode(raw, (CallbackData));
+
+        if (d.action == Action.DEPOSIT) {
+            (uint256 shares, uint256 c0, uint256 c1) = _doDeposit(d);
+            return abi.encode(shares, c0, c1);
+        }
+        if (d.action == Action.WITHDRAW) {
+            (uint256 o0, uint256 o1) = _doWithdraw(d);
+            return abi.encode(o0, o1);
+        }
+        (uint256 u0, uint256 u1) = _doUnwind();
+        return abi.encode(u0, u1);
+    }
+
+    function _unlock(CallbackData memory d) internal returns (bytes memory ret) {
+        _unlocking = true;
+        ret = poolManager.unlock(abi.encode(d));
+        _unlocking = false;
+    }
+
+    // ================================================================ actions (run inside unlock)
+    function _doDeposit(CallbackData memory d) internal returns (uint256 shares, uint256 c0, uint256 c1) {
+        _collectFees(); // fees earned so far belong to existing holders, so move them into idle first
+
+        (uint160 sqrtP, int24 tick,,) = StateLibrary.getSlot0(poolManager, PoolId.wrap(poolId));
+        uint256 supply = totalSupply();
+        bool first = supply == 0;
+
+        if (first) {
+            (tickLower, tickUpper) = RangeMath.centerRange(tick, key.tickSpacing, rangeWidthTicks);
+            uint128 dl = RangeMath.liquidityForAmounts(
+                sqrtP, TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper), d.amount0, d.amount1
+            );
+            if (dl <= VaultAccounting.MINIMUM_SHARES) revert DepositTooSmall();
+            shares = dl; // shares start equal to liquidity units, which do not depend on token decimals
+            c0 = d.amount0;
+            c1 = d.amount1;
+            IGuardHook(guardHook).notifyRebalanced(tickLower, tickUpper);
+        } else {
+            (uint256 a0, uint256 a1) = _holdings(sqrtP);
+            (shares, c0, c1) = VaultAccounting.depositShares(d.amount0, d.amount1, a0, a1, supply);
+        }
+
+        uint256 toReceiver = first ? shares - VaultAccounting.MINIMUM_SHARES : shares;
+        if (toReceiver == 0) revert ZeroShares();
+        if (toReceiver < d.minShares) revert SlippageExceeded();
+
+        if (c0 > 0) IERC20(token0).safeTransferFrom(d.user, address(this), c0);
+        if (c1 > 0) IERC20(token1).safeTransferFrom(d.user, address(this), c1);
+        idle0 += c0;
+        idle1 += c1;
+
+        _addLiquidity(sqrtP, c0, c1); // whatever the range cannot absorb stays idle, owned by all shares
+
+        if (first) _mint(address(0xdEaD), VaultAccounting.MINIMUM_SHARES);
+        _mint(d.receiver, toReceiver);
+        shares = toReceiver;
+    }
+
+    function _doWithdraw(CallbackData memory d) internal returns (uint256 out0, uint256 out1) {
+        _collectFees();
+
+        uint256 supply = totalSupply();
+        uint256 i0 = VaultAccounting.share(idle0, d.shares, supply);
+        uint256 i1 = VaultAccounting.share(idle1, d.shares, supply);
+
+        uint256 p0;
+        uint256 p1;
+        if (liquidity > 0) {
+            uint128 dl = uint128(VaultAccounting.share(liquidity, d.shares, supply));
+            if (dl > 0) (p0, p1) = _removeLiquidity(dl);
+        }
+
+        idle0 -= i0;
+        idle1 -= i1;
+        out0 = i0 + p0;
+        out1 = i1 + p1;
+
+        _burn(d.user, d.shares); // reverts if the user does not own that many shares
+        if (out0 > 0) IERC20(token0).safeTransfer(d.receiver, out0);
+        if (out1 > 0) IERC20(token1).safeTransfer(d.receiver, out1);
+    }
+
+    function _doUnwind() internal returns (uint256 u0, uint256 u1) {
+        _collectFees();
+        if (liquidity == 0) return (0, 0);
+        (u0, u1) = _removeLiquidity(liquidity);
+        idle0 += u0;
+        idle1 += u1;
+    }
+
+    // ================================================================ position helpers
+    /// @dev Touches the position with zero liquidity change, which credits accrued fees to this vault.
+    function _collectFees() internal {
+        if (liquidity == 0) return;
+        (BalanceDelta delta,) = poolManager.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: 0, salt: bytes32(0)}),
+            ""
+        );
+        int128 a0 = delta.amount0();
+        int128 a1 = delta.amount1();
+        if (a0 > 0) {
+            uint256 f0 = uint256(uint128(a0));
+            poolManager.take(key.currency0, address(this), f0);
+            idle0 += f0;
+        }
+        if (a1 > 0) {
+            uint256 f1 = uint256(uint128(a1));
+            poolManager.take(key.currency1, address(this), f1);
+            idle1 += f1;
+        }
+    }
+
+    function _addLiquidity(uint160 sqrtP, uint256 max0, uint256 max1) internal {
+        (uint128 dl,,) = RangeMath.fitLiquidity(
+            sqrtP, TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper), max0, max1
+        );
+        if (dl == 0) return;
+
+        (BalanceDelta delta,) = poolManager.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                liquidityDelta: int256(uint256(dl)),
+                salt: bytes32(0)
+            }),
+            ""
+        );
+        liquidity += dl;
+
+        int128 a0 = delta.amount0();
+        int128 a1 = delta.amount1();
+        if (a0 < 0) {
+            uint256 o0 = uint256(uint128(-a0));
+            idle0 -= o0;
+            _pay(key.currency0, token0, o0);
+        } else if (a0 > 0) {
+            uint256 t0 = uint256(uint128(a0));
+            poolManager.take(key.currency0, address(this), t0);
+            idle0 += t0;
+        }
+        if (a1 < 0) {
+            uint256 o1 = uint256(uint128(-a1));
+            idle1 -= o1;
+            _pay(key.currency1, token1, o1);
+        } else if (a1 > 0) {
+            uint256 t1 = uint256(uint128(a1));
+            poolManager.take(key.currency1, address(this), t1);
+            idle1 += t1;
+        }
+    }
+
+    /// @dev Removes `dl` liquidity and takes the principal to this contract. The caller decides where it goes.
+    function _removeLiquidity(uint128 dl) internal returns (uint256 p0, uint256 p1) {
+        (BalanceDelta delta,) = poolManager.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                liquidityDelta: -int256(uint256(dl)),
+                salt: bytes32(0)
+            }),
+            ""
+        );
+        liquidity -= dl;
+
+        int128 a0 = delta.amount0();
+        int128 a1 = delta.amount1();
+        if (a0 > 0) {
+            p0 = uint256(uint128(a0));
+            poolManager.take(key.currency0, address(this), p0);
+        }
+        if (a1 > 0) {
+            p1 = uint256(uint128(a1));
+            poolManager.take(key.currency1, address(this), p1);
+        }
+    }
+
+    function _pay(Currency currency, address token, uint256 amount) internal {
+        if (amount == 0) return;
+        poolManager.sync(currency);
+        IERC20(token).safeTransfer(address(poolManager), amount);
+        poolManager.settle();
+    }
+
+    function _holdings(uint160 sqrtP) internal view returns (uint256 a0, uint256 a1) {
+        if (liquidity > 0) {
+            (a0, a1) = RangeMath.amountsForLiquidity(
+                sqrtP, TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper), liquidity, false
+            );
+        }
+        a0 += idle0;
+        a1 += idle1;
+    }
+}

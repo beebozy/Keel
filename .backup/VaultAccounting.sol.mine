@@ -1,0 +1,113 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {FullMath} from "v4-core/libraries/FullMath.sol";
+
+/// @title VaultAccounting
+/// @notice Share accounting for a two-token concentrated-liquidity vault.
+/// @dev Deposits are proportional to existing holdings. No oracle is needed.
+library VaultAccounting {
+    // ---------------------------------------------------------------------
+    // Errors
+    // ---------------------------------------------------------------------
+
+    error InvalidSupply();
+    error NoExistingAssets();
+    error DepositTooSmall();
+
+    // ---------------------------------------------------------------------
+    // Constants
+    // ---------------------------------------------------------------------
+
+    /// @notice Shares permanently locked on the first deposit.
+    /// @dev This is a minimum-liquidity safeguard, not an economic fee.
+    uint256 internal constant MINIMUM_SHARES = 1_000;
+
+    // ---------------------------------------------------------------------
+    // Share calculations
+    // ---------------------------------------------------------------------
+
+    /// @notice Calculates the proportional share of an asset.
+    /// @param amount Total asset amount.
+    /// @param shares Shares being redeemed or accounted for.
+    /// @param supply Total outstanding shares.
+    /// @return amountShare The proportional asset amount, rounded down.
+    function share(uint256 amount, uint256 shares, uint256 supply) internal pure returns (uint256 amountShare) {
+        if (supply == 0) revert InvalidSupply();
+
+        amountShare = FullMath.mulDiv(amount, shares, supply);
+    }
+
+    // ---------------------------------------------------------------------
+    // Deposit calculations
+    // ---------------------------------------------------------------------
+
+    /// @notice Calculates shares and proportional token amounts for a deposit.
+    /// @dev The returned token amounts never exceed the requested amounts.
+    ///      Shares are calculated using the limiting token, so the depositor
+    ///      cannot change the vault's existing token proportions.
+    ///
+    /// @param amount0 Maximum token0 amount the depositor offers.
+    /// @param amount1 Maximum token1 amount the depositor offers.
+    /// @param holdings0 Existing managed token0 holdings.
+    /// @param holdings1 Existing managed token1 holdings.
+    /// @param supply Existing share supply.
+    ///
+    /// @return shares Shares to mint.
+    /// @return used0 Actual token0 amount to collect.
+    /// @return used1 Actual token1 amount to collect.
+    function depositShares(uint256 amount0, uint256 amount1, uint256 holdings0, uint256 holdings1, uint256 supply)
+        internal
+        pure
+        returns (uint256 shares, uint256 used0, uint256 used1)
+    {
+        if (supply == 0) revert InvalidSupply();
+
+        if (holdings0 == 0 && holdings1 == 0) {
+            revert NoExistingAssets();
+        }
+
+        // A single-sided position is possible when the pool price moves
+        // outside the vault's active liquidity range.
+        if (holdings0 == 0) {
+            shares = FullMath.mulDiv(amount1, supply, holdings1);
+
+            if (shares == 0) revert DepositTooSmall();
+
+            used1 = FullMath.mulDivRoundingUp(shares, holdings1, supply);
+
+            return (shares, 0, used1);
+        }
+
+        if (holdings1 == 0) {
+            shares = FullMath.mulDiv(amount0, supply, holdings0);
+
+            if (shares == 0) revert DepositTooSmall();
+
+            used0 = FullMath.mulDivRoundingUp(shares, holdings0, supply);
+
+            return (shares, used0, 0);
+        }
+
+        // Calculate how many shares each token amount could independently
+        // support. The smaller result determines the deposit size.
+        uint256 sharesFrom0 = FullMath.mulDiv(amount0, supply, holdings0);
+
+        uint256 sharesFrom1 = FullMath.mulDiv(amount1, supply, holdings1);
+
+        shares = sharesFrom0 < sharesFrom1 ? sharesFrom0 : sharesFrom1;
+
+        if (shares == 0) revert DepositTooSmall();
+
+        // Round the required token amounts up so the deposit does not
+        // underfund the shares being minted.
+        used0 = FullMath.mulDivRoundingUp(shares, holdings0, supply);
+
+        used1 = FullMath.mulDivRoundingUp(shares, holdings1, supply);
+
+        // Defensive checks against unexpected rounding behavior.
+        if (used0 > amount0 || used1 > amount1) {
+            revert DepositTooSmall();
+        }
+    }
+}
