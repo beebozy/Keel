@@ -46,7 +46,7 @@ contract GuardHook is BaseHook, IGuardHook {
     StrategyTypes.RiskMode public override mode;
     uint64 public lastModeChange; // timestamp
     uint64 public modeChangeBlock;
-    bytes32 public lastReason;
+    bytes32 public override lastReason;
     uint16 public stepDownsTotal;
 
     PoolId public poolId; // single pool; set in afterInitialize
@@ -54,7 +54,7 @@ contract GuardHook is BaseHook, IGuardHook {
     bool public tickInitialised;
     uint64 public lastCheckBlock;
 
-    bool public needsRebalance;
+    bool public override needsRebalance;
     uint16 public healthyStreak;
     uint64 public lastHealthyBlock;
 
@@ -217,8 +217,30 @@ contract GuardHook is BaseHook, IGuardHook {
         _setMode(_up(m), Reasons.STEP_UP);
     }
 
+    /// @notice Read-only oracle check for ADAPTIVE (zero when healthy). Lets the vault refuse deposits
+    ///         that would be priced against bad data.
+    function oracleReason() external view returns (bytes32) {
+        if (PoolId.unwrap(poolId) == bytes32(0)) revert PoolNotSet();
+        return _oracleReason();
+    }
+
     // ---------------------------------------------------------------- vault-only
     /// @dev The vault checks that the caller is the curator. Only strictly more restrictive targets.
+    /// @notice The checks a rebalance must pass. On failure it steps down and RETURNS false instead of
+    ///         reverting, so the step-down persists.
+    /// @dev The overdue (NO_REBALANCE) check is deliberately not applied here: a late rebalance should run,
+    ///      not be punished with a step-down.
+    function checkForRebalance() external onlyVault returns (bool ok) {
+        if (mode == StrategyTypes.RiskMode.ADAPTIVE) {
+            bytes32 reason = _oracleReason();
+            if (reason != Reasons.NONE) {
+                _stepDown(reason);
+                return false;
+            }
+        }
+        return true;
+    }
+
     function curatorStepDown(StrategyTypes.RiskMode target) external onlyVault {
         if (uint8(target) <= uint8(mode)) revert InvalidModeTransition();
         _goDown(target, Reasons.CURATOR);

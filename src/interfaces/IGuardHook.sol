@@ -35,11 +35,16 @@ interface IGuardHook {
     event RangeUpdated(int24 tickLower, int24 tickUpper);
 
     function mode() external view returns (StrategyTypes.RiskMode);
+    function lastReason() external view returns (bytes32);
+    function needsRebalance() external view returns (bool);
+    /// @notice Read-only oracle check for ADAPTIVE. Zero when healthy.
+    function oracleReason() external view returns (bytes32);
     function evaluate() external;
     function tryStepUp() external;
     function setVault(address vault) external;
 
     // vault only
+    function checkForRebalance() external returns (bool ok);
     function curatorStepDown(StrategyTypes.RiskMode target) external;
     function reportDrawdownBreach() external;
     function notifyRebalanced(int24 tickLower, int24 tickUpper) external;

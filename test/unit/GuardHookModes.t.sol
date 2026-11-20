@@ -402,6 +402,98 @@ contract GuardHookModesTest is Test {
         assertEq(uint8(hook.mode()), uint8(ADAPTIVE));
     }
 
+    // ------------------------------------------------------------ rebalance eligibility
+    function test_oracleReason_healthyIsNone() public view {
+        assertEq(hook.oracleReason(), Reasons.NONE);
+    }
+
+    function test_oracleReason_reportsFailuresWithoutChangingState() public {
+        oracle.setRevert(true);
+        assertEq(hook.oracleReason(), Reasons.ORACLE_FAIL);
+        assertEq(uint8(hook.mode()), uint8(ADAPTIVE)); // a view must not step down
+        assertEq(hook.stepDownsTotal(), 0);
+    }
+
+    function test_oracleReason_reportsStaleAndDeviating() public {
+        vm.warp(block.timestamp + 3601);
+        assertEq(hook.oracleReason(), Reasons.ORACLE_STALE);
+
+        oracle.setPrice(1.02e18); // setPrice refreshes the timestamp; only deviation remains
+        assertEq(hook.oracleReason(), Reasons.DEVIATION);
+    }
+
+    function test_checkForRebalance_onlyVault() public {
+        vm.expectRevert(GuardHook.NotVault.selector);
+        hook.checkForRebalance();
+
+        _link();
+        vm.expectRevert(GuardHook.NotVault.selector);
+        hook.checkForRebalance();
+    }
+
+    function test_checkForRebalance_healthyAdaptive_passes() public {
+        _link();
+        vm.prank(address(vaultView));
+        assertTrue(hook.checkForRebalance());
+        assertEq(uint8(hook.mode()), uint8(ADAPTIVE));
+        assertEq(hook.stepDownsTotal(), 0);
+    }
+
+    function test_checkForRebalance_staleOracle_stepsDownAndReturnsFalse() public {
+        _link();
+        vm.warp(block.timestamp + 3601);
+
+        vm.expectEmit(true, true, false, true, address(hook));
+        emit IGuardHook.ModeChanged(ADAPTIVE, RULE_BASED, Reasons.ORACLE_STALE);
+        vm.prank(address(vaultView));
+        assertFalse(hook.checkForRebalance());
+
+        assertEq(uint8(hook.mode()), uint8(RULE_BASED));
+        assertEq(hook.lastReason(), Reasons.ORACLE_STALE);
+        assertEq(hook.stepDownsTotal(), 1);
+    }
+
+    function test_checkForRebalance_oracleRevert_isOracleFail() public {
+        _link();
+        oracle.setRevert(true);
+        vm.prank(address(vaultView));
+        assertFalse(hook.checkForRebalance());
+        assertEq(hook.lastReason(), Reasons.ORACLE_FAIL);
+        assertEq(uint8(hook.mode()), uint8(RULE_BASED));
+    }
+
+    function test_checkForRebalance_deviation_stepsDown() public {
+        _link();
+        oracle.setPrice(1.02e18);
+        vm.prank(address(vaultView));
+        assertFalse(hook.checkForRebalance());
+        assertEq(hook.lastReason(), Reasons.DEVIATION);
+        assertEq(uint8(hook.mode()), uint8(RULE_BASED));
+    }
+
+    function test_checkForRebalance_ruleBasedIgnoresOracleFailures() public {
+        _link();
+        _stepDownViaStaleOracle();
+        oracle.setRevert(true);
+
+        vm.prank(address(vaultView));
+        assertTrue(hook.checkForRebalance());
+        assertEq(uint8(hook.mode()), uint8(RULE_BASED));
+        assertEq(hook.stepDownsTotal(), 1); // no additional step-down
+    }
+
+    function test_checkForRebalance_ignoresOverdueWindow() public {
+        _link();
+        vm.prank(address(vaultView));
+        hook.notifyRebalanced(60, 180); // tick 0 is outside the recorded range
+        vm.roll(block.number + 101); // past noRebalanceBlocks
+        oracle.setPrice(1e18);
+
+        vm.prank(address(vaultView));
+        assertTrue(hook.checkForRebalance());
+        assertEq(uint8(hook.mode()), uint8(ADAPTIVE)); // NO_REBALANCE is not applied here
+    }
+
     // ------------------------------------------------------------ label
     function test_describe_beforeAndAfterLink() public {
         Label memory a = hook.describe();
